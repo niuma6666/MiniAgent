@@ -54,7 +54,7 @@ MiniAgent 是一个**极简、透明、强大的 CLI Agent 框架**，拒绝臃�
 ## 快速开始
 
 ```bash
-git clone https://github.com/ZhuLinsen/MiniAgent.git && cd MiniAgent
+git clone https://github.com/niuma6666/MiniAgent.git && cd MiniAgent
 uv sync
 cp .env.example .env  # 填入你的 API Key
 uv run miniagent       # 启动！
@@ -68,7 +68,7 @@ uv run miniagent       # 启动！
 推荐使用 uv：
 
 ```bash
-git clone https://github.com/ZhuLinsen/MiniAgent.git
+git clone https://github.com/niuma6666/MiniAgent.git
 cd MiniAgent
 uv sync
 ```
