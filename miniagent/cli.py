@@ -233,7 +233,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     console.print(f"[dim]model:[/dim] {agent.model}  [dim]tools:[/dim] {len(agent.tools)}  [dim]type /help for commands[/dim]")
     
     # Streaming flag — can be toggled with /stream
-    use_streaming = os.environ.get("MINIAGENT_STREAM", "1") != "0"
+    use_streaming = os.environ.get("MINIAGENT_STREAM", "0") != "0"
     # Tool calling mode — "text" (default) or "native"
     run_mode = "text"
 
