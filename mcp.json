@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "tavily": {
+      "command": "C:/Program Files/nodejs/npx.cmd",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.tavily.com/mcp/?tavilyApiKey=你的key"
+      ]
+    }
+  }
+}
