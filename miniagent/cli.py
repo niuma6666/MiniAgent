@@ -232,6 +232,41 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     console.print(f"[dim]model:[/dim] {agent.model}  [dim]tools:[/dim] {len(agent.tools)}  [dim]type /help for commands[/dim]")
     
+
+    # ========== 新增：从 mcp.json 加载 MCP 工具 ==========
+    
+    import json
+    import os
+    from miniagent.extensions.mcp_client import load_mcp_tools
+
+    mcp_config_path = "mcp.json"  # 放在项目根目录
+    if os.path.exists(mcp_config_path):
+        with open(mcp_config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        for server_name, server_config in config.get("mcpServers", {}).items():
+            if server_config.get("disabled", False):
+                continue
+            cmd = server_config.get("command")
+            args_list = server_config.get("args", [])
+            full_cmd = f"{cmd} {' '.join(args_list)}" if isinstance(args_list, list) else cmd
+            console.print(f"[dim]Loading MCP server '{server_name}'...[/dim]")
+            tools = load_mcp_tools(full_cmd)
+            for tool in tools:
+                # 如果 Agent 有 add_tool 方法则用，否则直接追加到 tools 列表
+                if hasattr(agent, 'add_tool'):
+                    agent.add_tool(tool)
+                else:
+                    agent.tools.append(tool)
+        console.print(f"[green]✓[/green] Loaded MCP tools, total tools: {len(agent.tools)}")
+    else:
+        console.print("[dim]No mcp.json found, skipping MCP tools.[/dim]")
+
+    # ========== 新增结束 ==========
+
+
+
+
+
     # Streaming flag — can be toggled with /stream
     use_streaming = os.environ.get("MINIAGENT_STREAM", "0") != "0"
     # Tool calling mode — "text" (default) or "native"
