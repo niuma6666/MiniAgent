@@ -20,8 +20,10 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from ..logger import get_logger
+from rich.console import Console          # 新增
 
 logger = get_logger(__name__)
+console = Console()                       # 新建控制台实例
 
 
 class MCPClient:
@@ -79,13 +81,15 @@ class MCPClient:
         import threading
         import subprocess
 
-        print("[DEBUG] start() called")
+        #print("[DEBUG] start() called")
+        console.print("[dim][DEBUG] start() called[/dim]")
 
         # 合并环境变量
         merged_env = {**os.environ, **(self.env or {})}
     
         # 构建命令（保留原样）
-        print(f"[DEBUG] command: {self.command}")
+        #print(f"[DEBUG] command: {self.command}")
+        console.print(f"[dim][DEBUG] command: {self.command}[/dim]")
     
         # 启动子进程：强制 UTF-8 编码，分离 stderr 以避免污染 stdout
         self._process = subprocess.Popen(
@@ -99,35 +103,44 @@ class MCPClient:
             errors='replace'               # 遇到非法字节替换为 �（防止崩溃）
         )
     
-        print(f"[DEBUG] process started, pid={self._process.pid}")
+        #print(f"[DEBUG] process started, pid={self._process.pid}")
+        console.print(f"[dim][DEBUG] process started, pid={self._process.pid}[/dim]")
 
         # 启动 stdout 读取线程（处理 JSON-RPC 响应）
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
-        print("[DEBUG] reader thread started")
+        #print("[DEBUG] reader thread started")
+        console.print("[dim][DEBUG] reader thread started[/dim]")
 
         # 启动 stderr 读取线程（打印日志，便于调试）
         self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
         self._stderr_thread.start()
-        print("[DEBUG] stderr reader thread started")
+        #print("[DEBUG] stderr reader thread started")
+        console.print("[dim][DEBUG] stderr reader thread started[/dim]")
 
         # 等待一下让进程稳定
         time.sleep(0.5)
-        print(f"[DEBUG] After sleep, process poll={self._process.poll()}")
+        #print(f"[DEBUG] After sleep, process poll={self._process.poll()}")
+        console.print(f"[dim][DEBUG] After sleep, process poll={self._process.poll()}[/dim]")
 
         # 给子进程更多启动时间（原代码 1s）
         time.sleep(1)
     
         # 发送初始化请求
-        print("[DEBUG] sending initialize...")
+        #print("[DEBUG] sending initialize...")
+        console.print("[dim][DEBUG] sending initialize...[/dim]")
+
         self._send_request("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {"name": "miniagent", "version": "0.1.0"},
         })
-        print("[DEBUG] initialize sent, sending initialized notification...")
+        #print("[DEBUG] initialize sent, sending initialized notification...")
+        console.print("[dim][DEBUG] initialize sent, sending initialized notification...[/dim]")
+
         self._send_notification("initialized", {})
-        print("[DEBUG] start() finished")
+        #print("[DEBUG] start() finished")
+        console.print("[dim][DEBUG] start() finished[/dim]")
 
 
     #修改结束
@@ -378,9 +391,11 @@ class MCPClient:
             for line in iter(self._process.stderr.readline, ''):
                 if line:
                     # 可以加时间戳，或直接输出
-                    print(f"[MCP STDERR] {line.rstrip()}")
+                    #print(f"[MCP STDERR] {line.rstrip()}")
+                    console.print(f"[dim][MCP STDERR] {line.rstrip()}[/dim]")
         except Exception as e:
-            print(f"[MCP STDERR] reader error: {e}")
+            #print(f"[MCP STDERR] reader error: {e}")
+            console.print(f"[dim][MCP STDERR] reader error: {e}[/dim]")
 
     #新增方法结束
               
