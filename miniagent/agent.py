@@ -74,6 +74,44 @@ Note:
 5. When creating files, ALWAYS use the 'write' tool with 'path' and 'content' parameters
 6. For multi-line content, use \\n for newlines in JSON strings
 
+
+[NEW] ========== 工具调用优先级规则（CRITICAL） ==========
+
+1. 当用户的问题涉及以下任何内容时，你**必须首先调用 tavily_search 或 web_search**，不得直接使用内部知识回答：
+   - 要求“搜索”、“查找”、“核实”、“验证”某信息
+   - 询问“最新的”、“近期的”、“202X年”的研究或新闻
+   - 要求列出“参考文献”、“论文”、“文献综述”（尤其是涉及具体作者、标题、期刊时）
+   - 涉及事实性数据（股价、公司财务数据、统计数字）
+2. 只有在以下情况，你才可以直接使用内部知识回答：
+   - 用户问的是通用常识（如“什么是数字化转型”）
+   - 你已经尝试过搜索工具，但未返回有效结果
+   - 用户明确要求“不要搜索，直接回答”
+3. 如果你不确定某条引用是否真实，**必须先搜索验证，再引用**。
+
+Response Instructions:
+1. When calling tools, use EXACTLY: TOOL: xxx ARGS: {{...}}
+2. For your internal reasoning, you may use any language or symbols.
+3. 【Final Output Constraint】: All final answers, error explanations, and suggestions to the user MUST be written in Simplified Chinese (简体中文). 
+
+
+
+[NEW] ========== 批量搜索效率规则（CRITICAL for tavily_search） ==========
+
+当你需要同时核实或查找多个已知条目（如多篇论文标题、多个人名、多个公司名）时：
+1. **必须使用 `|`（竖线，表示 OR）** 将它们合并为 **1 次** `tavily_search` 或 `web_search` 调用。
+2. 语法示例：
+   - 核实 3 篇论文：TOOL: tavily_search  ARGS: {{"query": "\"吴非 2021 管理世界\" | \"黄大禹 2021 经济学家\" | \"赵宸宇 2021 财贸经济\""}}
+   - 查找多家公司市值：TOOL: tavily_search  ARGS: {{"query": "腾讯 市值 2024 | 阿里 市值 2024 | 字节 估值 2024"}}
+3. 注意事项：
+   - 每个条目用英文双引号 `" "` 包裹，防止分词打断。
+   - 条目之间用 ` | `（空格+竖线+空格）分隔。
+   - 总查询长度**不超过 400 个字符**（搜索引擎限制），如果超过，则拆分为 2 批。
+4. **禁止**为每个条目单独调用一次工具——这会浪费轮次、增加用户等待时间。
+5. 如果条目太多（超过 5 条），先搜索前 5 条，再搜索后 5 条，分 2 次完成。
+
+[NEW] ===============================================================
+
+
 If you don't need to use tools, you can directly answer the user's question. \
 If the question is outside the scope of the available tools, use your knowledge to answer directly."""
     
@@ -116,7 +154,7 @@ If the question is outside the scope of the available tools, use your knowledge 
         
         # Cache config limits (read env vars once, not per-request)
         self._max_context_messages = int(os.environ.get("MAX_CONTEXT_MESSAGES", "20"))
-        self._tool_result_limit = int(os.environ.get("TOOL_RESULT_LIMIT", "16000"))
+        self._tool_result_limit = int(os.environ.get("TOOL_RESULT_LIMIT", "80000"))     #16000改到80000，同步改.env文件
         
         # Initialize the LLM client
         self._init_llm_client()
@@ -307,8 +345,48 @@ If the question is outside the scope of the available tools, use your knowledge 
 
                 logger.warning(f"Failed to parse tool arguments for {name}: {args_str[:100]}...")
 
-        logger.debug("No tool call pattern matched")
+        # ---------- [NEW] 新增 fallback 解析（宽松匹配） ----------
+        # 如果上面的严格模式都没匹配成功，尝试从内容中提取类似 "calculator({...})" 或 "calculator: {...}" 的格式
+        fallback_patterns = [
+            r'(\w+)\s*\(\s*(\{.*?\})\s*\)',          # 匹配 func({...})
+            r'(\w+)[：:]\s*(\{.*\})',                # 匹配 func: {...}  或 func：{...}
+            r'(\w+)\s*\(\s*([^)]*)\)',               # 匹配 func(key=value, ...)  —— 这种可能不是 JSON，先提取再尝试构造
+        ]
+
+        for pattern in fallback_patterns:
+            match = re.search(pattern, content, re.DOTALL)
+            if match:
+                name = match.group(1)
+                args_candidate = match.group(2).strip()
+                # 尝试补全为合法 JSON
+                if not args_candidate.startswith('{'):
+                    # 如果内容是 "key=value, key2=value2" 这种，尝试转为 JSON 对象
+                    # 这里简单处理：如果它看起来像 JSON，直接解析；否则尝试用 parse_json 工具
+                    pass
+                # 优先尝试作为 JSON 解析
+                try:
+                    # 如果缺少花括号，补上
+                    if not args_candidate.startswith('{'):
+                        args_candidate = '{' + args_candidate + '}'
+                    args = json.loads(args_candidate)
+                    logger.info(f"Parsed tool call via fallback: {name} with {len(args)} args")
+                    return {"name": name, "arguments": args}
+                except json.JSONDecodeError:
+                    # 如果还是失败，使用已有的 parse_json 宽松解析
+                    args = parse_json(args_candidate)
+                    if args:
+                        logger.info(f"Parsed tool call via fallback (loose): {name} with {len(args)} args")
+                        return {"name": name, "arguments": args}
+                # 如果上述都失败，继续尝试下一个 fallback 模式
+                continue
+
+
+        # ---------- 原有结尾（保持不变） ----------
+    
+            logger.debug("No tool call pattern matched")
         return None
+
+
 
     def _extract_balanced_json(self, text: str) -> Optional[str]:
         """
@@ -371,7 +449,9 @@ If the question is outside the scope of the available tools, use your knowledge 
         """
         tool = next((t for t in self.tools if t["name"] == tool_call["name"]), None)
         if not tool:
-            return f"Error: Tool {tool_call['name']} not found"
+            #return f"Error: Tool {tool_call['name']} not found"
+            return f"错误：找不到工具 '{tool_call['name']}'，请检查工具名称是否正确。"
+
         try:
             if tool_callback:
                 tool_callback("start", tool_call["name"], {"arguments": tool_call.get("arguments", {})})
@@ -383,7 +463,9 @@ If the question is outside the scope of the available tools, use your knowledge 
             logger.error(f"Error executing tool {tool_call['name']}: {e}")
             if tool_callback:
                 tool_callback("end", tool_call["name"], {"error": str(e)})
-            return f"Error executing tool: {str(e)}"
+            #return f"Error executing tool: {str(e)}"
+            return f"执行工具 '{tool_call['name']}' 时出错：{str(e)}"
+
     
     def _maybe_reflect(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """Apply reflection if enabled and conversation has history."""
@@ -454,7 +536,7 @@ If the question is outside the scope of the available tools, use your knowledge 
             raise
 
     @staticmethod
-    def _summarize_messages(messages: List[Dict[str, str]], keep_last: int = 6) -> List[Dict[str, str]]:
+    def _summarize_messages(messages: List[Dict[str, str]], keep_last: int = 10) -> List[Dict[str, str]]:
         """
         Compress conversation history when it grows too long.
         
@@ -480,7 +562,7 @@ If the question is outside the scope of the available tools, use your knowledge 
         summary_parts = []
         for m in old_messages:
             role = m.get("role", "")
-            content = (m.get("content", "") or "")[:200]
+            content = (m.get("content", "") or "")[:300]   # 从200增加到300
             if role == "user":
                 summary_parts.append(f"User asked: {content}")
             elif role == "assistant":
@@ -615,11 +697,40 @@ If the question is outside the scope of the available tools, use your knowledge 
             # Parse tool call
             tool_call = self._parse_tool_call(response)
             if not tool_call:
+                '''
                 logger.info("No tool call in response, returning final answer")
                 return response
+                '''
+
+
+                # 🔧 改动2：不再直接返回，而是尝试让模型用中文重新回答或总结
+                logger.info("No tool call detected, but we need to ensure a Chinese final answer.")
+                # 如果已经迭代多次，可能是模型一直在瞎说，直接强制要求总结
+                if iteration >= max_iterations - 1:
+                    messages.append({
+                        "role": "user",
+                        "content": "请根据你已有的知识，用中文直接回答用户的问题，不要再尝试调用工具。"
+                    })
+                    response = self._call_llm(messages)
+                    return response
+                else:
+                    # 否则，提示模型给出中文回复，并继续循环（让模型重新输出）
+                    messages.append({
+                        "role": "user",
+                        "content": "你没有调用任何工具，请直接以中文回答用户的问题，或者如果需要工具，请按照指定格式输出 TOOL: ... ARGS: ..."
+                    })
+                    iteration += 1
+                    continue  # 重新进入下一轮循环，让模型重新生成
             
+
+
+
+
+
             # Execute tool (with safety + truncation)
             result_str, rejected = self._safe_execute_tool(tool_call, tool_callback, status_callback, limit)
+
+            '''
             if rejected:
                 messages.append({
                     "role": "user",
@@ -632,9 +743,48 @@ If the question is outside the scope of the available tools, use your knowledge 
                 })
             
             iteration += 1
-        
+            '''
+
+            # 🔧 改动3：根据执行结果，用中文引导消息，而非直接塞入英文错误
+            if rejected:
+                messages.append({
+                    "role": "user",
+                    "content": f"用户拒绝了工具 '{tool_call['name']}' 的执行，请建议一个安全的替代方案，或用中文直接回答。"
+                })
+            else:
+                # 检查 result_str 是否包含英文错误关键词
+                if isinstance(result_str, str) and ("Error" in result_str or "Exception" in result_str):
+                    # 用中文提示模型处理错误
+                    messages.append({
+                        "role": "user",
+                        "content": f"工具 '{tool_call['name']}' 执行时返回了错误信息：{result_str}\n请你用中文向用户解释这个错误，并给出可能的解决方案或替代方法。"
+                    })
+                else:
+                    # 正常结果，但也要用中文引导
+                    messages.append({
+                        "role": "user",
+                        "content": f"工具 '{tool_call['name']}' 执行结果如下：\n{result_str}\n请根据这个结果，用中文继续回答用户的问题，如果需要，可以再次调用其他工具。"
+                    })
+
+            iteration += 1
+
+
+
+        '''
         logger.warning(f"Reached maximum iterations ({max_iterations})")
         return messages[-1]["content"]
+        '''
+        # 🔧 改动4：达到最大迭代次数时，强制生成最终中文答案
+        logger.warning(f"Reached maximum iterations ({max_iterations})")
+        messages.append({
+            "role": "user",
+            "content": "你已尝试多次工具调用，请根据所有已知信息，用中文给出最终答案，不要再调用工具。"
+        })
+        final_response = self._call_llm(messages)
+        return final_response
+
+
+
 
     def run_with_native_tools(
         self,
@@ -733,7 +883,7 @@ If the question is outside the scope of the available tools, use your knowledge 
             return last.get("content", "")
         return getattr(last, "content", "") or ""
 
-    def run(self, query: str, max_iterations: int = 10, mode: str = "text") -> str:
+    def run(self, query: str, max_iterations: int = 15, mode: str = "native") -> str:     #mode默认模式从text改为native，max_iterations从10改到15，.env同步改
         """
         Execute the Agent with specified tool calling mode.
         
