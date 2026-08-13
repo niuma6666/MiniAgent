@@ -155,7 +155,7 @@ python -m pytest tests/ -v
 | `LLM_ORGANIZATION` | — | OpenAI organization ID |
 | `BASH_TIMEOUT` | 120 | bash 工具默认超时时间（秒） |
 | `BASH_MAX_OUTPUT` | 50000 | bash 输出最大字符数 |
-| `TOOL_RESULT_LIMIT` | 16000 | 工具结果回传给 LLM 的最大字符数 |
+| `TOOL_RESULT_LIMIT` | 80000 | 工具结果回传给 LLM 的最大字符数 |
 | `MAX_CONTEXT_MESSAGES` | 20 | 超过此数量自动压缩对话历史 |
 | `CONFIRM_DANGEROUS` | true | 是否拦截危险 bash 命令 |
 | `MINIAGENT_STREAM` | 1 | 是否启用流式输出（0=关闭） |
