@@ -14,7 +14,7 @@
 1. 克隆仓库：
 
 ```bash
-git clone https://github.com/ZhuLinsen/MiniAgent.git
+git clone https://github.com/niuma6666/MiniAgent.git
 cd MiniAgent
 ```
 
