@@ -54,7 +54,7 @@ That's the power of minimalism: let the LLM do what it does best — **think and
 ## Quick Start
 
 ```bash
-git clone https://github.com/ZhuLinsen/MiniAgent.git && cd MiniAgent
+git clone https://github.com/niuma6666/MiniAgent.git && cd MiniAgent
 uv sync
 cp .env.example .env  # Fill in your API Key
 uv run miniagent       # Launch!
@@ -68,7 +68,7 @@ uv run miniagent       # Launch!
 Recommended with uv:
 
 ```bash
-git clone https://github.com/ZhuLinsen/MiniAgent.git
+git clone https://github.com/niuma6666/MiniAgent.git
 cd MiniAgent
 uv sync
 ```
