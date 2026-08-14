@@ -79,17 +79,21 @@ Available tools: {tools_prompt}
    - Combine multiple related queries with ` | ` (OR) in one call, e.g., `"paper A" | "paper B"`.
    - Max 400 characters per call; split if exceeded.
 
-4. **After tool execution**:
-   - Explain the result clearly and concisely in Simplified Chinese.
-   - If no tool needed, answer directly in Simplified Chinese.
+4. **Response & Termination**:
+   - After executing a tool, explain the result clearly.
+   - **When you believe you have fully answered the user's question (whether or not you used a tool), you MUST start your final response with `FINAL_ANSWER:`**.
+   - After using `FINAL_ANSWER:`, do NOT call any more tools. This is the only way to end the task.
 
-5. **Interpersonal skills**:
+5. **Final Output Format**:
+   - Use Simplified Chinese as the primary language. Proper nouns, technical terms, acronyms, and file/API names may remain in English.
+   - Use markdown for readability when helpful.
+
+6. **Interpersonal skills**:
    - Greet briefly when appropriate.
    - If request is vague, ask clarifying questions BEFORE using tools.
    - Acknowledge user's emotions (e.g., "I understand you're looking for...").
    - Respond naturally, politely, and helpfully.
 
-6. **Final output**: Use Simplified Chinese as the primary language. Proper nouns, technical terms, acronyms, and file/API names may remain in English. Use markdown for readability when helpful.
 
 Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess."""
 
@@ -148,6 +152,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         self.use_reflector = use_reflector
         self.confirm_dangerous = confirm_dangerous
         self.confirm_callback = confirm_callback
+        self._skill_tool_whitelist = None   # 存储技能允许的工具名称列表，None表示不过滤
         
         # Cache config limits (read env vars once, not per-request)
         self._max_context_messages = int(os.environ.get("MAX_CONTEXT_MESSAGES", "20"))
@@ -263,38 +268,6 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             self.load_builtin_tool(name)
 
 
-    '''
-    def load_skill(self, skill_name: str) -> bool:
-        """
-        Apply a registered Skill to this agent.
-        
-        Updates system_prompt, temperature, and optionally filters tools
-        to only those specified in the skill.
-        
-        Args:
-            skill_name: Name of a registered skill
-            
-        Returns:
-            True if skill was loaded successfully
-        """
-        from .skills import get_skill
-        
-        skill = get_skill(skill_name)
-        if not skill:
-            logger.warning(f"Skill not found: {skill_name}")
-            return False
-        
-        self.system_prompt = skill.prompt
-        if skill.temperature is not None:
-            self.temperature = skill.temperature
-        # Filter tools to skill whitelist
-        if skill.tools is not None:
-            self.tools = [t for t in self.tools if t["name"] in skill.tools]
-            logger.info(f"Skill '{skill_name}' filtered tools to: {[t['name'] for t in self.tools]}")
-        
-        logger.info(f"Loaded skill: {skill_name}")
-        return True
-    '''
     
     
     
@@ -313,37 +286,52 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         
         # 暂存到实例变量，让主循环感知
         self._loaded_skill = skill
+
+        # 不再修改 self.tools，而是记录白名单
+        self._skill_tool_whitelist = skill.tools  # 可能为 None 或列表
         
-        # 同时应用 temperature 和 tools 过滤（直接修改实例状态）
+        # 应用 temperature 过滤（直接修改实例状态）
         if skill.temperature is not None:
             self.temperature = skill.temperature
         
-        if skill.tools is not None:
-            # 只保留 Skill 允许的工具
-            self.tools = [t for t in self.tools if t["name"] in skill.tools]
-            logger.info(f"Skill '{skill_name}' filtered tools to: {[t['name'] for t in self.tools]}")
         
         return f"✅ 成功加载技能 '{skill_name}'。请根据该技能的指引执行任务。"
     # ==================== 【改动 2 插入结束】 ====================
 
 
+    def _get_filtered_tools(self) -> List[Dict]:
+        """
+        根据当前加载的技能返回过滤后的工具列表。
+        如果技能未指定白名单（_skill_tool_whitelist 为 None），则返回全部工具。
+        """
+        if self._loaded_skill and self._skill_tool_whitelist is not None:
+            return [t for t in self.tools if t["name"] in self._skill_tool_whitelist]
+        return self.tools
 
+  
     def _build_tools_prompt(self) -> str:
         """
-        Build the tools description for the system prompt
-        
-        Returns:
-            Formatted tools description
+        构建工具描述字符串，供 system prompt 使用。
+        如果当前加载了技能且技能指定了工具白名单，则只显示白名单中的工具。
         """
+        # 获取当前应该展示的工具列表（根据技能白名单过滤）
+        tools_to_show = self._get_filtered_tools()
+
+        # 如果最终列表为空，直接返回提示信息（避免空描述）
+        if not tools_to_show:
+            return "(没有可用工具)"
+
         tools_desc = []
-        for tool in self.tools:
+        for tool in tools_to_show:
             params = tool.get("parameters", {})
             param_desc = []
+            # 构建参数描述
             for name, schema in params.get("properties", {}).items():
                 required = name in params.get("required", [])
                 param_desc.append(f"    - {name}: {schema.get('description', '')} {'(required)' if required else ''}")
-            
             params_text = "\n".join(param_desc) if param_desc else "    (none)"
+        
+            # 组装单个工具的描述（格式与原来保持一致）
             desc = (
                 f"\n            Tool: {tool['name']}\n"
                 f"            Description: {tool['description']}\n"
@@ -352,8 +340,12 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 f"            "
             )
             tools_desc.append(desc)
+    
         return "\n".join(tools_desc)
     
+
+
+
     def _parse_tool_call(self, content: str) -> Optional[Dict]:
         """
         Parse tool call from LLM response.
@@ -696,6 +688,21 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         result = self._execute_tool(tool_call, tool_callback=tool_callback)
         return smart_truncate(str(result), limit), False
     
+
+
+    
+
+    def _build_dynamic_system_prompt(self) -> str:
+        """根据当前加载的技能动态构建系统提示词"""
+        base = self._loaded_skill.prompt if self._loaded_skill else self.system_prompt
+        return self._TEXT_MODE_PROMPT.format(
+            base_prompt=base,
+            tools_prompt=self._build_tools_prompt(),
+        )
+
+
+
+
     def run_with_tools(
         self,
         query: str,
@@ -704,45 +711,28 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         status_callback: Optional[Callable[[str], None]] = None,
         stream_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
-        """
-        Implement tool calling with formatted text
-        
-        This method uses specific text formats to represent tool calls, simulating native tools functionality.
-        Suitable for scenarios requiring explicit tool calls, and can be used with models that don't support native tools.
-        
-        Args:
-            query: User query text
-            max_iterations: Maximum number of tool execution iterations
-            tool_callback: Callback for tool execution events
-            status_callback: Callback for status updates (e.g. "Thinking...", "Executing tool...")
-            stream_callback: Callback for streaming tokens. If provided, LLM responses stream token-by-token.
-            
-        Returns:
-            Final response text
-        """
         logger.info(f"Starting query processing with tools: {query}")
-        
-        system_prompt = self._TEXT_MODE_PROMPT.format(
-            base_prompt=self.system_prompt,
-            tools_prompt=self._build_tools_prompt(),
-        )
-        
+
+        # 初始化消息（system 占位，稍后动态更新）
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": ""},  # 占位，每轮前会更新
             {"role": "user", "content": query}
         ]
-        
         max_ctx, limit = self._max_context_messages, self._tool_result_limit
-        
-        iteration = 0
-        while iteration < max_iterations:
+
+        # 使用 for 循环自动管理迭代次数
+        for iteration in range(max_iterations):
             logger.info(f"Iteration {iteration + 1}/{max_iterations}")
             messages = self._compress_if_needed(messages, max_ctx)
-            
+
+            # ===== 动态更新 system prompt =====
+            system_content = self._build_dynamic_system_prompt()
+            messages[0] = {"role": "system", "content": system_content}
+
             if status_callback:
                 status_callback(f"Thinking (Iteration {iteration + 1})...")
 
-            # Get model response (streaming or blocking)
+            # 获取模型响应
             if stream_callback:
                 chunks = []
                 for token in self._call_llm_stream(messages):
@@ -751,119 +741,60 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 response = "".join(chunks)
             else:
                 response = self._call_llm(messages)
+
+            # 检测 FINAL_ANSWER
+            if response.strip().startswith("FINAL_ANSWER:"):
+                return response[len("FINAL_ANSWER:"):].strip()
+
             messages.append({"role": "assistant", "content": response})
-            
-            # Parse tool call
+
+            # 解析工具调用
             tool_call = self._parse_tool_call(response)
+
+            # 无工具调用
             if not tool_call:
-                '''
-                logger.info("No tool call in response, returning final answer")
-                return response
-                '''
-
-                # 🔧 改动2：不再直接返回，而是尝试让模型用中文重新回答或总结
-                logger.info("No tool call detected, but we need to ensure a Chinese final answer.")
-                # 如果已经迭代多次，可能是模型一直在瞎说，直接强制要求总结
-                if iteration >= max_iterations - 1:
-                    messages.append({
-                        "role": "user",
-                        "content": "请根据你已有的知识，用中文直接回答用户的问题，不要再尝试调用工具。"
-                    })
-                    response = self._call_llm(messages)
+                # 启发式判断：若响应足够长且无“未完成”暗示，视为完成
+                if len(response) > 100 and not any(kw in response for kw in ["需要查询", "需要搜索", "请稍等", "我会查找"]):
+                    logger.info("No tool call but response seems complete, returning.")
                     return response
-                else:
-                    # 否则，提示模型给出中文回复，并继续循环（让模型重新输出）
-                    messages.append({
-                        "role": "user",
-                        #"content": "你没有调用任何工具，请直接以中文回答用户的问题，或者如果需要工具，请按照指定格式输出 TOOL: ... ARGS: ..."
-                        "content": "当前回复没有包含工具调用。如果你需要获取外部信息，请按格式输出 TOOL: xxx ARGS: {{...}}；如果你认为已有足够信息，请直接用中文给出最终回答。"
-                    })
-                    iteration += 1
-                    continue  # 重新进入下一轮循环，让模型重新生成
-            
-
-            # ==================== 【skill的改动 4 插入开始】 ====================
-            # 特殊拦截 use_skill 工具（文本模式）
-            if tool_call["name"] == "use_skill":
-                # 直接执行 handler
-                result_str = self._use_skill_handler(**tool_call["arguments"])
-                
-                # 如果加载了技能，将技能 prompt 注入到消息历史中
-                if self._loaded_skill:
-                    messages.append({
-                        "role": "system",
-                        "content": f"## 已加载技能：{self._loaded_skill.name}\n\n{self._loaded_skill.prompt}"
-                    })
-                
-                # 将工具执行结果追加到消息历史（用于告知 LLM 加载成功）
+                # 否则引导
                 messages.append({
                     "role": "user",
-                    "content": f"工具执行结果：{tool_call['name']} 返回：{result_str}"
+                    "content": "当前回复没有工具调用且不完整。请调用工具获取信息，或如果已足够，请以 FINAL_ANSWER: 开头给出最终回答。"
                 })
-                
-                iteration += 1
-                continue  # 跳过后续的 _safe_execute_tool
-            # ==================== 【改动 4 插入结束】 ====================
+                continue  # 下一轮
 
+            # 处理 use_skill
+            if tool_call["name"] == "use_skill":
+                result_str = self._use_skill_handler(**tool_call["arguments"])
+                messages.append({
+                    "role": "user",
+                    "content": f"工具 '{tool_call['name']}' 执行结果：{result_str}"
+                })
+                continue  # 下一轮，此时 _loaded_skill 已更新
 
-
-
-
-            # Execute tool (with safety + truncation)
+            # 执行其他工具
             result_str, rejected = self._safe_execute_tool(tool_call, tool_callback, status_callback, limit)
 
-            '''
             if rejected:
-                messages.append({
-                    "role": "user",
-                    "content": f"Tool execution of '{tool_call['name']}' was rejected by user. Please suggest a safer alternative."
-                })
+                feedback = f"用户拒绝了工具 '{tool_call['name']}'，请建议安全的替代方案或用中文回答。"
+            elif isinstance(result_str, str) and ("Error" in result_str or "Exception" in result_str):
+                feedback = f"工具 '{tool_call['name']}' 出错：{result_str}\n请解释错误并给出解决方案。"
             else:
-                messages.append({
-                    "role": "user",
-                    "content": f"Tool execution result: {tool_call['name']} returned: {result_str}\nContinue answering the user's question, or call another tool if needed."
-                })
-            
-            iteration += 1
-            '''
+                feedback = f"工具 '{tool_call['name']}' 结果：{result_str}\n请继续用中文回答，完成时以 FINAL_ANSWER: 开头。"
 
-            # 🔧 改动3：根据执行结果，用中文引导消息，而非直接塞入英文错误
-            if rejected:
-                messages.append({
-                    "role": "user",
-                    "content": f"用户拒绝了工具 '{tool_call['name']}' 的执行，请建议一个安全的替代方案，或用中文直接回答。"
-                })
-            else:
-                # 检查 result_str 是否包含英文错误关键词
-                if isinstance(result_str, str) and ("Error" in result_str or "Exception" in result_str):
-                    # 用中文提示模型处理错误
-                    messages.append({
-                        "role": "user",
-                        "content": f"工具 '{tool_call['name']}' 执行时返回了错误信息：{result_str}\n请你用中文向用户解释这个错误，并给出可能的解决方案或替代方法。"
-                    })
-                else:
-                    # 正常结果，但也要用中文引导
-                    messages.append({
-                        "role": "user",
-                        "content": f"工具 '{tool_call['name']}' 执行结果如下：\n{result_str}\n请根据这个结果，用中文继续回答用户的问题，如果需要，可以再次调用其他工具。"
-                    })
+            messages.append({"role": "user", "content": feedback})
 
-            iteration += 1
-
-
-
-        '''
-        logger.warning(f"Reached maximum iterations ({max_iterations})")
-        return messages[-1]["content"]
-        '''
-        # 🔧 改动4：达到最大迭代次数时，强制生成最终中文答案
+        # 超出迭代次数，强制生成最终答案
         logger.warning(f"Reached maximum iterations ({max_iterations})")
         messages.append({
             "role": "user",
-            "content": "你已尝试多次工具调用，请根据所有已知信息，用中文给出最终答案，不要再调用工具。"
+            "content": "你已尝试多次工具调用，请根据所有已知信息，用中文给出最终答案，并以 FINAL_ANSWER: 开头。"
         })
-        final_response = self._call_llm(messages)
-        return final_response
+        final = self._call_llm(messages)
+        if final.strip().startswith("FINAL_ANSWER:"):
+            return final[len("FINAL_ANSWER:"):].strip()
+        return final
 
 
 
@@ -875,24 +806,11 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         tool_callback: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
         status_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
-        """
-        Run agent using OpenAI native function calling (tools parameter).
-        
-        This is the alternative to run_with_tools() for models that support native FC.
-        More reliable parsing, supports parallel tool calls.
-        
-        Args:
-            query: User query text
-            max_iterations: Maximum number of tool execution iterations
-            tool_callback: Callback for tool execution events
-            status_callback: Callback for status updates
-            
-        Returns:
-            Final response text
-        """
         logger.info(f"Starting native FC query: {query}")
-        
-        # Build OpenAI-format tool schemas
+
+        '''
+        # [CHANGED] 不再在外部构建 tool_schemas，改为循环内动态构建
+        # 构建工具 schema（不含 use_skill? 保留，因为要拦截）
         tool_schemas = [{
             "type": "function",
             "function": {
@@ -901,21 +819,35 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 "parameters": t.get("parameters", {"type": "object", "properties": {}}),
             }
         } for t in self.tools]
-        
+        '''
+
         messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": ""},  # 占位
             {"role": "user", "content": query}
         ]
-        
         max_ctx, limit = self._max_context_messages, self._tool_result_limit
-        
-        iteration = 0
-        while iteration < max_iterations:
+
+        for iteration in range(max_iterations):
             messages = self._compress_if_needed(messages, max_ctx)
-            
+
+            # 动态更新 system
+            system_content = self._build_dynamic_system_prompt()
+            messages[0] = {"role": "system", "content": system_content}
+
             if status_callback:
                 status_callback(f"Thinking (Iteration {iteration + 1})...")
-            
+
+            # [CHANGED] 在这里动态构建 tool_schemas，基于当前过滤后的工具列表
+            filtered_tools = self._get_filtered_tools()
+            tool_schemas = [{
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t.get("parameters", {"type": "object", "properties": {}}),
+                }
+            } for t in filtered_tools]
+
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -926,14 +858,19 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             except Exception as e:
                 logger.error(f"Native FC LLM call failed: {e}")
                 raise
-            
+
             msg = response.choices[0].message
-            
+
+            # 检测 FINAL_ANSWER
+            if msg.content and msg.content.strip().startswith("FINAL_ANSWER:"):
+                return msg.content[len("FINAL_ANSWER:"):].strip()
+
+            # 无工具调用，直接返回内容（可能已经回答）
             if not msg.tool_calls:
                 return msg.content or ""
-            
+
             messages.append(msg)
-            
+
             for tc in msg.tool_calls:
                 tool_name = tc.function.name
                 try:
@@ -941,58 +878,47 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 except json.JSONDecodeError:
                     arguments = parse_json(tc.function.arguments) or {}
 
-                # ==================== 【改动 3 插入开始】 ====================
-                # 特殊拦截 use_skill 工具
                 if tool_name == "use_skill":
-                    # 直接执行 handler（不经过 _safe_execute_tool，因为不需要安全检查）
                     result_str = self._use_skill_handler(**arguments)
-                    
-                    # 如果加载了技能，将技能 prompt 注入到消息历史中
-                    if self._loaded_skill:
-                        messages.append({
-                            "role": "system",
-                            "content": f"## 已加载技能：{self._loaded_skill.name}\n\n{self._loaded_skill.prompt}"
-                        })
-                        # 清除标记，防止重复注入（但如果后续再调用，会再次注入）
-                        # self._loaded_skill = None  # 如果你希望每次调用都重新加载，保留即可
-                    
-                    # 将工具执行结果追加到消息历史
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": result_str,
                     })
-                    
-                    # 继续处理下一个 tool call，不执行后续的 _safe_execute_tool
+                    # 注意：_loaded_skill 和 _skill_tool_whitelist 已更新，
+                    # 下一轮循环会使用新的过滤列表
                     continue
-                # ==================== 【改动 3 插入结束】 ====================
-                
-
-
 
                 tool_call_info = {"name": tool_name, "arguments": arguments}
                 result_str, rejected = self._safe_execute_tool(
                     tool_call_info, tool_callback, status_callback, limit
                 )
-                
-                if rejected:
-                    content = "Execution rejected by user. Please suggest a safer alternative."
-                else:
-                    content = result_str
-                
+                content = "Execution rejected by user. Suggest a safer alternative." if rejected else result_str
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": content,
                 })
-            
-            iteration += 1
-        
+
+        # 超出迭代次数，强制最终回答
         logger.warning(f"Native FC reached max iterations ({max_iterations})")
-        last = messages[-1]
-        if isinstance(last, dict):
-            return last.get("content", "")
-        return getattr(last, "content", "") or ""
+        messages.append({
+            "role": "user",
+            "content": "请根据已有信息，用中文给出最终答案，并以 FINAL_ANSWER: 开头。"
+        })
+        final_response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+        )
+        final = final_response.choices[0].message.content
+        if final and final.strip().startswith("FINAL_ANSWER:"):
+            return final[len("FINAL_ANSWER:"):].strip()
+        return final or ""
+
+
+
+
 
     def run(self, query: str, max_iterations: int = 15, mode: str = "native") -> str:     #mode默认模式从text改为native，max_iterations从10改到15，.env同步改
         """
