@@ -130,6 +130,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         self.api_key = api_key
         self.base_url = base_url
         self.temperature = temperature
+        self._base_temperature = temperature  # 保存初始基准温度，用于重置
         self.system_prompt = system_prompt
 
         
@@ -272,6 +273,19 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
     
     
     # ==================== 【改动 2 插入开始】 ====================
+    
+    def _reset_skill_state(self):
+        """
+        重置技能加载状态，确保每次新的 run() 调用不受上一次技能残留影响。
+        """
+        self._loaded_skill = None
+        self._skill_tool_whitelist = None
+        # 恢复用户最初设定的温度，避免被上次技能修改
+        self.temperature = self._base_temperature
+        logger.debug("Skill state has been reset.")
+
+    
+    
     def _use_skill_handler(self, skill_name: str) -> str:
         """
         处理 use_skill 工具调用的执行器。
@@ -282,6 +296,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         
         skill = get_skill(skill_name)
         if not skill:
+            self._reset_skill_state()   # ====== 新增：加载失败时清除可能残留的旧技能状态
             return f"错误：未找到技能 '{skill_name}'。可用技能：{list(_SKILLS.keys())}"
         
         # 暂存到实例变量，让主循环感知
@@ -405,6 +420,15 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             if match:
                 name = match.group(1)
                 args_candidate = match.group(2).strip()
+
+                # ========== 【新增：防止误解析】 ==========
+                # 只有提取的名称确实是已注册的工具时，才继续处理
+                # 否则直接跳过，避免将普通文本（如 "我猜是 python(3.8)"）误判为工具调用
+                if name not in registered_tool_names:
+                    logger.debug(f"Fallback ignored '{name}' - not a registered tool.")
+                    continue
+                # ===========================================
+
                 # 尝试补全为合法 JSON
                 if not args_candidate.startswith('{'):
                     # 如果内容是 "key=value, key2=value2" 这种，尝试转为 JSON 对象
@@ -498,6 +522,22 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         Returns:
             Tool execution result
         """
+
+        tool_name = tool_call["name"]  # ===== 提取工具名 =====
+
+        # ==================== 【新增校验 开始】 ====================
+        # 1. 如果是 use_skill，永远放行（防止用户被锁死，无法切换技能）
+        # 2. 如果加载了技能且技能指定了白名单（非None），检查工具是否在白名单内
+        if (tool_name != "use_skill" 
+            and self._loaded_skill is not None 
+            and self._skill_tool_whitelist is not None 
+            and tool_name not in self._skill_tool_whitelist):
+        
+            # 返回错误信息，LLM 看到后会重新选择正确的工具或调用 use_skill
+            return f"错误：工具 '{tool_name}' 不在当前技能 '{self._loaded_skill.name}' 的允许列表中。请使用白名单内的工具，或调用 use_skill 切换技能。"
+        # ==================== 【新增校验 结束】 ====================
+
+
         tool = next((t for t in self.tools if t["name"] == tool_call["name"]), None)
         if not tool:
             #return f"Error: Tool {tool_call['name']} not found"
@@ -515,7 +555,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             if tool_callback:
                 tool_callback("end", tool_call["name"], {"error": str(e)})
             #return f"Error executing tool: {str(e)}"
-            return f"执行工具 '{tool_call['name']}' 时出错：{str(e)}"
+            return f"错误：执行工具 '{tool_call['name']}' 时出错：{str(e)}"
 
     
     def _maybe_reflect(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -609,6 +649,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         old_messages = messages[start:-keep_last]
         recent = messages[-keep_last:]
         
+
+        '''
         # Build a compact summary of old conversation
         summary_parts = []
         for m in old_messages:
@@ -626,6 +668,46 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             "role": "user",
             "content": f"[Conversation summary - {len(old_messages)} earlier messages compressed]\n{summary}\n[End of summary. Continue from here.]"
         }
+        '''
+
+        # ========== 改进点 1：限制摘要条目数，防止摘要过长 ==========
+        # 最多保留最近 15 条旧消息做摘要，避免压缩本身产生大量 token
+        if len(old_messages) > 15:
+            old_messages = old_messages[-15:]
+
+        summary_parts = []
+        for m in old_messages:
+            role = m.get("role", "").upper()
+            content = (m.get("content", "") or "")
+
+            # ========== 改进点 2：用 smart_truncate 替代硬截断 ==========
+            # smart_truncate 会尝试在完整句子边界处截断，避免切词
+            truncated = smart_truncate(content, 300)
+
+            # ========== 改进点 3：保留结构化角色标记 ==========
+            if role == "USER":
+                summary_parts.append(f"[用户] {truncated}")
+            elif role == "ASSISTANT":
+                summary_parts.append(f"[助手] {truncated}")
+            elif role == "TOOL":
+                summary_parts.append(f"[工具结果] {truncated}")
+            else:
+                summary_parts.append(f"[{role}] {truncated}")
+
+        summary = "\n".join(summary_parts)
+
+        # ========== 改进点 4：更清晰的压缩标记 ==========
+        total_compressed = len(messages) - keep_last - (1 if system else 0)
+        summary_msg = {
+            "role": "user",
+            "content": (
+                f"[历史会话压缩] 已将较早的 {total_compressed} 条消息压缩为摘要：\n"
+                f"{summary}\n"
+                f"[压缩结束，请基于上述摘要和最近的对话继续]"
+            )
+        }
+
+        #===改动结束
         
         result = []
         if system:
@@ -633,6 +715,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         result.append(summary_msg)
         result.extend(recent)
         return result
+
+
 
     def _check_dangerous(self, tool_call: Dict) -> bool:
         """
@@ -701,6 +785,40 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         )
 
 
+    #============新增两个方法，改进 run_with_tools 与 run_with_native_tools 大量重复 的问题
+
+    def _init_run(self, query: str):
+        """
+        初始化每次运行的公共环境：重置技能状态、初始化消息列表、获取限制参数
+        """
+        self._reset_skill_state()
+        logger.info(f"Starting query: {query[:50]}...")
+        messages = [
+            {"role": "system", "content": ""},  # 占位，每轮动态更新
+            {"role": "user", "content": query}
+        ]
+        return messages, self._max_context_messages, self._tool_result_limit
+
+
+
+    def _force_final_answer(self, messages: List[Dict], max_iterations: int) -> str:
+        """
+        当超出迭代次数时，强制LLM生成最终答案（两种模式完全一致的逻辑）
+        """
+        logger.warning(f"Reached maximum iterations ({max_iterations})")
+        messages.append({
+            "role": "user",
+            "content": "你已尝试多次工具调用，请根据所有已知信息，用中文给出最终答案，并以 FINAL_ANSWER: 开头。"
+        })
+        # 统一使用 _call_llm（自带重试），替代原生方法中直接调用 client.chat.completions.create
+        final = self._call_llm(messages)
+        if final.strip().startswith("FINAL_ANSWER:"):
+            return final[len("FINAL_ANSWER:"):].strip()
+        return final
+
+
+    #========新增结束
+
 
 
     def run_with_tools(
@@ -711,6 +829,10 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         status_callback: Optional[Callable[[str], None]] = None,
         stream_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
+
+         
+        '''
+        self._reset_skill_state()   # =====新增：每次运行前强制重置技能状态
         logger.info(f"Starting query processing with tools: {query}")
 
         # 初始化消息（system 占位，稍后动态更新）
@@ -719,6 +841,11 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             {"role": "user", "content": query}
         ]
         max_ctx, limit = self._max_context_messages, self._tool_result_limit
+        '''
+
+        # ===== 替换初始化代码 =====
+        messages, max_ctx, limit = self._init_run(query)
+
 
         # 使用 for 循环自动管理迭代次数
         for iteration in range(max_iterations):
@@ -806,9 +933,12 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         tool_callback: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
         status_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
-        logger.info(f"Starting native FC query: {query}")
 
         '''
+        self._reset_skill_state()   # =====新增：每次运行前强制重置技能状态
+        logger.info(f"Starting native FC query: {query}")
+
+        
         # [CHANGED] 不再在外部构建 tool_schemas，改为循环内动态构建
         # 构建工具 schema（不含 use_skill? 保留，因为要拦截）
         tool_schemas = [{
@@ -819,13 +949,19 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 "parameters": t.get("parameters", {"type": "object", "properties": {}}),
             }
         } for t in self.tools]
-        '''
+        
 
         messages = [
             {"role": "system", "content": ""},  # 占位
             {"role": "user", "content": query}
         ]
         max_ctx, limit = self._max_context_messages, self._tool_result_limit
+        '''
+
+        # ===== 替换初始化代码 =====
+        messages, max_ctx, limit = self._init_run(query)
+
+
 
         for iteration in range(max_iterations):
             messages = self._compress_if_needed(messages, max_ctx)
@@ -900,6 +1036,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                     "content": content,
                 })
 
+
+        '''
         # 超出迭代次数，强制最终回答
         logger.warning(f"Native FC reached max iterations ({max_iterations})")
         messages.append({
@@ -915,7 +1053,10 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         if final and final.strip().startswith("FINAL_ANSWER:"):
             return final[len("FINAL_ANSWER:"):].strip()
         return final or ""
+        '''
 
+        # ===== 替换结尾的强制回答代码（现在统一使用 _call_llm） =====
+        return self._force_final_answer(messages, max_iterations)
 
 
 
