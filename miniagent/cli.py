@@ -213,6 +213,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     Environment variables (LLM_API_KEY, LLM_MODEL, LLM_API_BASE) can be set
     in a ``.env`` file or exported directly.
     """
+    global _current_status
+
     parser = argparse.ArgumentParser(prog="miniagent", description="MiniAgent - Minimalist CLI Agent Framework")
     parser.add_argument("--version", "-V", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", help="Path to config JSON")
@@ -240,6 +242,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     from miniagent.extensions.mcp_client import load_mcp_tools
 
     mcp_config_path = "mcp.json"  # 放在项目根目录
+    mcp_clients = []  # <--- 新增第 1 行：定义空列表收集客户端
+
     if os.path.exists(mcp_config_path):
         with open(mcp_config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -251,6 +255,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             full_cmd = f"{cmd} {' '.join(args_list)}" if isinstance(args_list, list) else cmd
             console.print(f"[dim]Loading MCP server '{server_name}'...[/dim]")
             tools = load_mcp_tools(full_cmd)
+
+            # <--- 新增第 2 段：收集客户端（去重）
+            for tool in tools:
+                if "_mcp_client" in tool:
+                    client = tool["_mcp_client"]
+                    if client not in mcp_clients:
+                        mcp_clients.append(client)
+
+            # <--- 原有注册循环不变
             for tool in tools:
                 # 如果 Agent 有 add_tool 方法则用，否则直接追加到 tools 列表
                 if hasattr(agent, 'add_tool'):
@@ -274,13 +287,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     history: List[Dict[str, str]] = []
 
+
+    '''
     while True:
         try:
             user_text = Prompt.ask("[cyan]you[/cyan]")
             user_text = user_text.strip()
         except (EOFError, KeyboardInterrupt):
             console.print()
-            break
+            break    # 退出循环，进入 finally
 
         if not user_text:
             continue
@@ -335,7 +350,164 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Prepare streaming callback
         _stream_chunks: List[str] = []
         _stream_has_tool_call = False
+    '''
+
+    
+    # ========== 修改点：将主循环包裹在 try-finally 中 ==========
+    try:
+        while True:
+            try:
+                user_text = Prompt.ask("[cyan]you[/cyan]")
+                user_text = user_text.strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                break
+
+            if not user_text:
+                continue
+
+            if user_text in ("/q", "/quit", "/exit"):
+                break
+            if user_text in ("/c", "/clear"):
+                history.clear()
+                console.print(f"[dim]cleared[/dim]")
+                continue
+            if user_text == "/stream":
+                use_streaming = not use_streaming
+                console.print(f"[dim]streaming {'on' if use_streaming else 'off'}[/dim]")
+                continue
+            if user_text == "/model":
+                console.print(f"[dim]current model:[/dim] {agent.model}")
+                try:
+                    new_model = Prompt.ask("[dim]new model (enter to keep)[/dim]", default=agent.model)
+                    if new_model != agent.model:
+                        agent.model = new_model
+                        console.print(f"[green]✓[/green] switched to {new_model}")
+                except (EOFError, KeyboardInterrupt):
+                    pass
+                continue
+            if user_text == "/mode":
+                run_mode = "native" if run_mode == "text" else "text"
+                console.print(f"[dim]mode: {run_mode}[/dim]")
+                continue
+            if user_text in ("/help", "help"):
+                console.print("[bold]Commands:[/bold]")
+                console.print("  /help    show this help")
+                console.print("  /c       clear conversation history")
+                console.print("  /stream  toggle streaming output")
+                console.print("  /model   switch LLM model")
+                console.print("  /mode    toggle text/native FC mode")
+                console.print("  /tools   list loaded tools")
+                console.print("  /q       quit")
+                console.print(f"\n[dim]model: {agent.model} | mode: {run_mode} | streaming: {'on' if use_streaming else 'off'} | tools: {len(agent.tools)}[/dim]")
+                continue
+            if user_text == "/tools":
+                console.print(f"[bold]Loaded Tools ({len(agent.tools)}):[/bold]")
+                for t in agent.tools:
+                    desc = t['description'].split('\n')[0][:70]
+                    console.print(f"  [cyan]{t['name']:<18}[/cyan] {desc}")
+                continue
+
+            history.append({"role": "user", "content": user_text})
+            memory.push("user", user_text)
+
+            query = _format_history(history) + user_text
+            
+            # Prepare streaming callback
+            _stream_chunks: List[str] = []
+            _stream_has_tool_call = False
+            
+
+
+            def _stream_callback(token: str) -> None:
+                """Print streaming tokens, but suppress if it's a tool call block."""
+                nonlocal _stream_has_tool_call, _stream_chunks
+                _stream_chunks.append(token)
+                # Detect tool call patterns early and stop printing
+                partial = "".join(_stream_chunks)
+                if "TOOL:" in partial or "Tool:" in partial or "工具:" in partial:
+                    _stream_has_tool_call = True
+                    return
+                if not _stream_has_tool_call:
+                    console.print(token, end="", highlight=False)
+
+            try:
+                # Show thinking indicator
+                with console.status("[dim]Thinking...[/dim]", spinner="dots") as status:
+                    global _current_status
+                    _current_status = status
+                    try:
+                        if run_mode == "native":
+                            response = agent.run_with_native_tools(
+                                query,
+                                tool_callback=_tool_callback,
+                                status_callback=_status_callback,
+                            )
+                        else:
+                            response = agent.run_with_tools(
+                                query, 
+                                tool_callback=_tool_callback,
+                                status_callback=_status_callback,
+                                stream_callback=_stream_callback if use_streaming else None,
+                            )
+                    finally:
+                        _current_status = None
+            except TypeError:
+                # Backward compatibility if tool_callback not available.
+                response = agent.run(query, mode=run_mode)
+            except Exception as e:
+                console.print(f"[red]error:[/red] {type(e).__name__}: {str(e)[:200]}")
+                continue
+
+            history.append({"role": "assistant", "content": response})
+            memory.push("assistant", response)
+
+            # If streaming printed the final answer already, just add a newline
+            if use_streaming and _stream_chunks and not _stream_has_tool_call:
+                console.print()  # newline after streamed output
+                continue
+
+            # Truncate overly long responses for display (keep full in history)
+            display_response = response
+            if len(response) > 2000:
+                # Count lines and truncate if too long
+                lines = response.split('\n')
+                if len(lines) > 50:
+                    display_response = '\n'.join(lines[:20]) + f'\n\n... ({len(lines) - 40} lines omitted) ...\n\n' + '\n'.join(lines[-20:])
+                else:
+                    display_response = response[:1000] + f'\n\n... ({len(response) - 2000} chars omitted) ...\n\n' + response[-1000:]
+            
+            console.print(Panel(Markdown(display_response), title="assistant", style="green", border_style="green"))
+
+
+    #为了改这里改了一段缩进
+    finally:
+        # 1.清理 rich 状态，防止守护线程残留
         
+        if _current_status:
+            _current_status.stop()
+            _current_status = None
+
+
+        # 2. 停止所有 MCP 客户端（终止子进程）
+        for client in mcp_clients:
+            try:
+                client.stop()
+            except Exception as e:
+                console.print(f"[dim]Error stopping MCP client: {e}[/dim]")
+
+        # 如果 MiniAgent 未来有 cleanup 方法，可在此调用
+        if hasattr(agent, 'cleanup'):
+            agent.cleanup()
+        console.print("[dim]Cleanup complete.[/dim]")
+
+    return 0
+
+    #修改结束
+
+
+
+    '''
         def _stream_callback(token: str) -> None:
             """Print streaming tokens, but suppress if it's a tool call block."""
             nonlocal _stream_has_tool_call, _stream_chunks
@@ -397,6 +569,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         console.print(Panel(Markdown(display_response), title="assistant", style="green", border_style="green"))
 
     return 0
+    '''
 
 
 if __name__ == "__main__":
