@@ -12,6 +12,9 @@ from .utils.text_utils import smart_truncate
 from .utils.reflector import Reflector
 from .tools import get_registered_tools, get_tool, get_tool_description
 
+from rich.console import Console
+console = Console()
+
 logger = get_logger(__name__)
 
 
@@ -52,6 +55,11 @@ class MiniAgent:
 You are a helpful, empathetic assistant with access to tools. Follow these rules:
 
 Available tools: {tools_prompt}
+
+0.**Skill Selection** (On-Demand):
+   - Check if the user's request matches any registered skill (e.g., literature review -> `literature_reviewer`, coding -> `coder`).
+   - If matched: Call `use_skill` FIRST, then follow its instructions.
+   - If unmatched: Skip. Answer directly or use general tools (search, read/write).
 
 1. **Tool format** (required):
    TOOL: <tool_name>
@@ -119,6 +127,22 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         self.base_url = base_url
         self.temperature = temperature
         self.system_prompt = system_prompt
+
+        
+
+        # ========== 插入开始：注入 Skill 目录到 system_prompt ==========
+        from .skills import _SKILLS
+        skills_catalog_parts = []
+        for name, skill in _SKILLS.items():
+            desc = skill.description or "无描述"
+            skills_catalog_parts.append(f"- {name}: {desc}")
+        if skills_catalog_parts:
+            skills_catalog = "\n".join(skills_catalog_parts)
+            self.system_prompt = self.system_prompt + "\n\n## 可用技能 (Available Skills)\n" + skills_catalog + "\n当用户问题匹配某技能时，可调用 use_skill 工具加载。"
+        # ========== 插入结束 ==========
+
+        
+
         self.tools = []
         self.client = None
         self.use_reflector = use_reflector
@@ -137,6 +161,29 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             self.reflector = Reflector(self.client, self.model)
         else:
             self.reflector = None
+
+
+        # ==================== 【改动 1 插入开始】 ====================
+        # 注册内置的 use_skill 工具
+        self.add_tool({
+            "name": "use_skill",
+            "description": "加载指定名称的技能。当用户的问题匹配某个特定技能（如 coder、researcher、literature_reviewer）时，调用此工具加载其完整指引。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "技能名称，例如 'coder', 'researcher', 'literature_reviewer'"
+                    }
+                },
+                "required": ["skill_name"]
+            },
+            "executor": self._use_skill_handler  # 指向下面的处理方法
+        })
+        # 初始化一个占位，用于存储当前加载的技能
+        self._loaded_skill = None
+        # ==================== 【改动 1 插入结束】 ====================
+
         
         logger.info(f"MiniAgent initialized, model: {model}, base URL: {base_url or 'default'}, temperature: {temperature}, reflector: {use_reflector}")
     
@@ -215,6 +262,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         for name in self.get_available_tools():
             self.load_builtin_tool(name)
 
+
+    '''
     def load_skill(self, skill_name: str) -> bool:
         """
         Apply a registered Skill to this agent.
@@ -245,7 +294,40 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         
         logger.info(f"Loaded skill: {skill_name}")
         return True
+    '''
     
+    
+    
+    # ==================== 【改动 2 插入开始】 ====================
+    def _use_skill_handler(self, skill_name: str) -> str:
+        """
+        处理 use_skill 工具调用的执行器。
+        只负责加载 Skill 对象并暂存到 self._loaded_skill，不修改 messages。
+        主循环会检测到这个变量并注入 prompt。
+        """
+        from .skills import get_skill, _SKILLS
+        
+        skill = get_skill(skill_name)
+        if not skill:
+            return f"错误：未找到技能 '{skill_name}'。可用技能：{list(_SKILLS.keys())}"
+        
+        # 暂存到实例变量，让主循环感知
+        self._loaded_skill = skill
+        
+        # 同时应用 temperature 和 tools 过滤（直接修改实例状态）
+        if skill.temperature is not None:
+            self.temperature = skill.temperature
+        
+        if skill.tools is not None:
+            # 只保留 Skill 允许的工具
+            self.tools = [t for t in self.tools if t["name"] in skill.tools]
+            logger.info(f"Skill '{skill_name}' filtered tools to: {[t['name'] for t in self.tools]}")
+        
+        return f"✅ 成功加载技能 '{skill_name}'。请根据该技能的指引执行任务。"
+    # ==================== 【改动 2 插入结束】 ====================
+
+
+
     def _build_tools_prompt(self) -> str:
         """
         Build the tools description for the system prompt
@@ -357,6 +439,10 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         # ---------- 原有结尾（保持不变） ----------
     
             logger.debug("No tool call pattern matched")
+
+        # 新增：当所有解析尝试都失败时，记录前200字符供调试
+        #logger.warning(f"无法解析的工具调用内容(前200字符): {content[:200]}")
+        console.print(f"无法解析的工具调用内容(前200字符): {content[:200]}", style="dim")
         return None
 
 
@@ -675,7 +761,6 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 return response
                 '''
 
-
                 # 🔧 改动2：不再直接返回，而是尝试让模型用中文重新回答或总结
                 logger.info("No tool call detected, but we need to ensure a Chinese final answer.")
                 # 如果已经迭代多次，可能是模型一直在瞎说，直接强制要求总结
@@ -690,11 +775,35 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                     # 否则，提示模型给出中文回复，并继续循环（让模型重新输出）
                     messages.append({
                         "role": "user",
-                        "content": "你没有调用任何工具，请直接以中文回答用户的问题，或者如果需要工具，请按照指定格式输出 TOOL: ... ARGS: ..."
+                        #"content": "你没有调用任何工具，请直接以中文回答用户的问题，或者如果需要工具，请按照指定格式输出 TOOL: ... ARGS: ..."
+                        "content": "当前回复没有包含工具调用。如果你需要获取外部信息，请按格式输出 TOOL: xxx ARGS: {{...}}；如果你认为已有足够信息，请直接用中文给出最终回答。"
                     })
                     iteration += 1
                     continue  # 重新进入下一轮循环，让模型重新生成
             
+
+            # ==================== 【skill的改动 4 插入开始】 ====================
+            # 特殊拦截 use_skill 工具（文本模式）
+            if tool_call["name"] == "use_skill":
+                # 直接执行 handler
+                result_str = self._use_skill_handler(**tool_call["arguments"])
+                
+                # 如果加载了技能，将技能 prompt 注入到消息历史中
+                if self._loaded_skill:
+                    messages.append({
+                        "role": "system",
+                        "content": f"## 已加载技能：{self._loaded_skill.name}\n\n{self._loaded_skill.prompt}"
+                    })
+                
+                # 将工具执行结果追加到消息历史（用于告知 LLM 加载成功）
+                messages.append({
+                    "role": "user",
+                    "content": f"工具执行结果：{tool_call['name']} 返回：{result_str}"
+                })
+                
+                iteration += 1
+                continue  # 跳过后续的 _safe_execute_tool
+            # ==================== 【改动 4 插入结束】 ====================
 
 
 
@@ -831,7 +940,36 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                     arguments = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
                     arguments = parse_json(tc.function.arguments) or {}
+
+                # ==================== 【改动 3 插入开始】 ====================
+                # 特殊拦截 use_skill 工具
+                if tool_name == "use_skill":
+                    # 直接执行 handler（不经过 _safe_execute_tool，因为不需要安全检查）
+                    result_str = self._use_skill_handler(**arguments)
+                    
+                    # 如果加载了技能，将技能 prompt 注入到消息历史中
+                    if self._loaded_skill:
+                        messages.append({
+                            "role": "system",
+                            "content": f"## 已加载技能：{self._loaded_skill.name}\n\n{self._loaded_skill.prompt}"
+                        })
+                        # 清除标记，防止重复注入（但如果后续再调用，会再次注入）
+                        # self._loaded_skill = None  # 如果你希望每次调用都重新加载，保留即可
+                    
+                    # 将工具执行结果追加到消息历史
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result_str,
+                    })
+                    
+                    # 继续处理下一个 tool call，不执行后续的 _safe_execute_tool
+                    continue
+                # ==================== 【改动 3 插入结束】 ====================
                 
+
+
+
                 tool_call_info = {"name": tool_name, "arguments": arguments}
                 result_str, rejected = self._safe_execute_tool(
                     tool_call_info, tool_callback, status_callback, limit
