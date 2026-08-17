@@ -3,6 +3,7 @@
 import os
 import json
 import re
+import time
 from typing import Any, Callable, Dict, Generator, List, Optional
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
@@ -157,7 +158,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         
         # Cache config limits (read env vars once, not per-request)
         self._max_context_messages = int(os.environ.get("MAX_CONTEXT_MESSAGES", "20"))
-        self._tool_result_limit = int(os.environ.get("TOOL_RESULT_LIMIT", "80000"))     #16000改到80000，同步改.env文件
+        self._tool_result_limit = int(os.environ.get("TOOL_RESULT_LIMIT", "800000"))     #16000改到800000，同步改.env文件
         
         # Initialize the LLM client
         self._init_llm_client()
@@ -286,29 +287,31 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
 
     
     
+    
     def _use_skill_handler(self, skill_name: str) -> str:
         """
         处理 use_skill 工具调用的执行器。
         只负责加载 Skill 对象并暂存到 self._loaded_skill，不修改 messages。
         主循环会检测到这个变量并注入 prompt。
         """
+
         from .skills import get_skill, _SKILLS
         
+        start = time.perf_counter()
+    
         skill = get_skill(skill_name)
         if not skill:
-            self._reset_skill_state()   # ====== 新增：加载失败时清除可能残留的旧技能状态
+            self._reset_skill_state()
+            console.print(f"[dim]❌ Skill load FAILED: '{skill_name}' (not found)[/dim]")
             return f"错误：未找到技能 '{skill_name}'。可用技能：{list(_SKILLS.keys())}"
-        
-        # 暂存到实例变量，让主循环感知
+    
         self._loaded_skill = skill
-
-        # 不再修改 self.tools，而是记录白名单
-        self._skill_tool_whitelist = skill.tools  # 可能为 None 或列表
-        
-        # 应用 temperature 过滤（直接修改实例状态）
+        self._skill_tool_whitelist = skill.tools
         if skill.temperature is not None:
             self.temperature = skill.temperature
-        
+
+        elapsed = time.perf_counter() - start
+        console.print(f"[dim]✅ SKILL LOADED: '{skill_name}' | temp={self.temperature} | tools_whitelist={self._skill_tool_whitelist} | max_iter={skill.max_iterations} | elapsed={elapsed:.3f}s[/dim]")
         
         return f"✅ 成功加载技能 '{skill_name}'。请根据该技能的指引执行任务。"
     # ==================== 【改动 2 插入结束】 ====================
@@ -499,7 +502,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
 
         # 新增：当所有解析尝试都失败时，记录前200字符供调试
         #logger.warning(f"无法解析的工具调用内容(前200字符): {content[:200]}")
-        console.print(f"无法解析的工具调用内容(前200字符): {content[:200]}", style="dim")
+        
+        console.print(f"[dim]⚠️ 无法解析的工具调用内容(前200字符): {content[:200]}[/dim]")
         return None
 
 
@@ -549,11 +553,16 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         logger.debug(f"Unbalanced braces (count={brace_count}), cannot extract JSON")
         return None
     
+
+
+   
+        
     def _execute_tool(
         self,
         tool_call: Dict,
         tool_callback: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
     ) -> Any:
+
         """
         Execute a tool call
         
@@ -564,41 +573,53 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             Tool execution result
         """
 
-        tool_name = tool_call["name"]  # ===== 提取工具名 =====
 
-        # ==================== 【新增校验 开始】 ====================
-        # 1. 如果是 use_skill，永远放行（防止用户被锁死，无法切换技能）
-        # 2. 如果加载了技能且技能指定了白名单（非None），检查工具是否在白名单内
+        start = time.perf_counter()
+        tool_name = tool_call["name"]
+        args = tool_call.get("arguments", {})
+
+
+        # 原有白名单校验...
         if (tool_name != "use_skill" 
             and self._loaded_skill is not None 
             and self._skill_tool_whitelist is not None 
             and tool_name not in self._skill_tool_whitelist):
-        
-            # 返回错误信息，LLM 看到后会重新选择正确的工具或调用 use_skill
-            return f"错误：工具 '{tool_name}' 不在当前技能 '{self._loaded_skill.name}' 的允许列表中。请使用白名单内的工具，或调用 use_skill 切换技能。"
-        # ==================== 【新增校验 结束】 ====================
+            elapsed = time.perf_counter() - start
+            console.print(f"[dim]🚫 Tool BLOCKED: {tool_name} (not in skill whitelist) | elapsed={elapsed:.3f}s[/dim]")
+            return f"错误：工具 '{tool_name}' 不在当前技能 '{self._loaded_skill.name}' 的允许列表中。"
 
 
-        tool = next((t for t in self.tools if t["name"] == tool_call["name"]), None)
+        tool = next((t for t in self.tools if t["name"] == tool_name), None)
         if not tool:
-            #return f"Error: Tool {tool_call['name']} not found"
-            return f"错误：找不到工具 '{tool_call['name']}'，请检查工具名称是否正确。"
+            elapsed = time.perf_counter() - start
+            console.print(f"[dim]❌ Tool NOT FOUND: {tool_name} | elapsed={elapsed:.3f}s[/dim]")
+            return f"错误：找不到工具 '{tool_name}'"
+
 
         try:
             if tool_callback:
-                tool_callback("start", tool_call["name"], {"arguments": tool_call.get("arguments", {})})
-            result = tool["executor"](**tool_call["arguments"])
+                tool_callback("start", tool_name, {"arguments": args})
+            result = tool["executor"](**args)
             if tool_callback:
-                tool_callback("end", tool_call["name"], {"result": result})
+                tool_callback("end", tool_name, {"result": result})
+            elapsed = time.perf_counter() - start
+        
+
+            # 关键：区分是否 use_skill
+            if tool_name == "use_skill":
+                console.print(f"[dim]🧠 SKILL TOOL CALL: {tool_name} args={str(args)[:80]} elapsed={elapsed:.3f}s[/dim]")
+            else:
+                console.print(f"[dim]🔧 TOOL CALL: {tool_name} args={str(args)[:80]} elapsed={elapsed:.3f}s[/dim]")
             return result
+
         except Exception as e:
-            logger.error(f"Error executing tool {tool_call['name']}: {e}")
-            if tool_callback:
-                tool_callback("end", tool_call["name"], {"error": str(e)})
-            #return f"Error executing tool: {str(e)}"
-            return f"错误：执行工具 '{tool_call['name']}' 时出错：{str(e)}"
+            elapsed = time.perf_counter() - start
+            console.print(f"[dim]💥 TOOL ERROR: {tool_name} | elapsed={elapsed:.3f}s | error={str(e)[:50]}[/dim]")
+            return f"错误：执行工具 '{tool_name}' 时出错：{str(e)}"
 
     
+
+
     def _maybe_reflect(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """Apply reflection if enabled and conversation has history."""
         if self.use_reflector and len(messages) > 1 and self.reflector:
@@ -616,6 +637,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         Returns:
             LLM response content
         """
+        start = time.perf_counter()  # <--- 计时开始
+
         try:
             logger.debug(f"Calling LLM with API key: {self.api_key[:6]}...")
             logger.debug(f"Base URL: {self.base_url or 'default OpenAI'}")
@@ -632,10 +655,22 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 messages=messages,
                 temperature=self.temperature
             )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+            elapsed = time.perf_counter() - start  # <--- 计算耗时
+
+            # <--- 日志打印位置（成功时） --->
+            console.print(f"[dim]🤖 LLM call ({self.model}) succeeded in {elapsed:.3f}s[/dim]")
+            return content
+
         except Exception as e:
+            elapsed = time.perf_counter() - start  # <--- 计算耗时（即使报错）
             logger.error(f"Error calling LLM: {str(e)}")
+
+            # <--- 日志打印位置（失败时） --->
+            console.print(f"[dim]💥 LLM call ({self.model}) failed in {elapsed:.3f}s: {str(e)[:60]}[/dim]")
             raise
+
+
 
     def _call_llm_stream(self, messages: List[Dict[str, str]]) -> Generator[str, None, None]:
         """
@@ -647,6 +682,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         Yields:
             Token strings as they stream in
         """
+        start = time.perf_counter()  # <--- 计时开始
+
         if not self.api_key:
             raise ValueError("API key is not set.")
         
@@ -663,9 +700,20 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if delta and delta.content:
                     yield delta.content
+
+            # <--- 正常流式结束，打印耗时（在循环外、try内部） --->
+            elapsed = time.perf_counter() - start
+            console.print(f"[dim]🤖 LLM stream ({self.model}) completed in {elapsed:.3f}s[/dim]")
+
         except Exception as e:
+            # <--- 流式过程出错，打印失败耗时 --->
+            elapsed = time.perf_counter() - start
             logger.error(f"Streaming error during iteration: {e}")
+            console.print(f"[dim]💥 LLM stream ({self.model}) failed in {elapsed:.3f}s: {str(e)[:60]}[/dim]")
             raise
+
+
+
 
     @staticmethod
     def _summarize_messages(messages: List[Dict[str, str]], keep_last: int = 10) -> List[Dict[str, str]]:
@@ -819,11 +867,18 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
 
     def _build_dynamic_system_prompt(self) -> str:
         """根据当前加载的技能动态构建系统提示词"""
+
         base = self._loaded_skill.prompt if self._loaded_skill else self.system_prompt
+        if self._loaded_skill:
+            console.print(f"[dim]📄 Using SKILL PROMPT: {self._loaded_skill.name}[/dim]")
+        else:
+            console.print(f"[dim]📄 Using DEFAULT SYSTEM PROMPT (no skill loaded)[/dim]")
+
         return self._TEXT_MODE_PROMPT.format(
             base_prompt=base,
             tools_prompt=self._build_tools_prompt(),
         )
+
 
 
     #============新增两个方法，改进 run_with_tools 与 run_with_native_tools 大量重复 的问题
