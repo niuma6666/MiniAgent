@@ -377,6 +377,47 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         """
         logger.debug(f"Parsing tool call from content (length={len(content)})")
 
+        # ========== 【新增】解析 MCP 格式的 XML 标签 ==========
+        # 匹配 <｜｜DSML｜｜tool_calls> ... </｜｜DSML｜｜tool_calls>
+        xml_pattern = re.compile(
+            r'<｜｜DSML｜｜tool_calls>\s*(.*?)\s*</｜｜DSML｜｜tool_calls>',
+            re.DOTALL
+        )
+        xml_match = xml_pattern.search(content)
+        if xml_match:
+            inner = xml_match.group(1)
+            # 提取所有 <｜｜DSML｜｜invoke name="..."> ... </｜｜DSML｜｜invoke>
+            invoke_pattern = re.compile(
+                r'<｜｜DSML｜｜invoke\s+name="([^"]+)"\s*>(.*?)</｜｜DSML｜｜invoke>',
+                re.DOTALL
+            )
+            invokes = invoke_pattern.findall(inner)
+            if invokes:
+                # 只取第一个工具调用（简化处理）
+                name, args_xml = invokes[0]
+                # 提取所有 <｜｜DSML｜｜parameter name="..." ...> ... </｜｜DSML｜｜parameter> 或自闭合
+                param_pattern = re.compile(
+                    r'<｜｜DSML｜｜parameter\s+name="([^"]+)"(?:\s+string="true")?\s*>(.*?)</｜｜DSML｜｜parameter>',
+                    re.DOTALL
+                )
+                params = param_pattern.findall(args_xml)
+                args = {}
+                for pname, pvalue in params:
+                    args[pname] = pvalue.strip()
+                # 如果有参数则返回
+                if args:
+                    logger.info(f"Parsed MCP tool call: {name} with args {args}")
+                    return {"name": name, "arguments": args}
+                else:
+                    # 如果没有参数，可能是无参调用
+                    logger.info(f"Parsed MCP tool call: {name} with no args")
+                    return {"name": name, "arguments": {}}
+        # ======================================================
+
+
+        # ===== 新增：获取当前已注册的工具名称列表 =====
+        registered_tool_names = [tool["name"] for tool in self.tools]
+
         # Two clean patterns: strict and relaxed
         tool_name_patterns = [
             r"TOOL:\s*(\w+)\s*ARGS:\s*",
@@ -831,18 +872,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
     ) -> str:
 
          
-        '''
-        self._reset_skill_state()   # =====新增：每次运行前强制重置技能状态
-        logger.info(f"Starting query processing with tools: {query}")
-
-        # 初始化消息（system 占位，稍后动态更新）
-        messages = [
-            {"role": "system", "content": ""},  # 占位，每轮前会更新
-            {"role": "user", "content": query}
-        ]
-        max_ctx, limit = self._max_context_messages, self._tool_result_limit
-        '''
-
+       
         # ===== 替换初始化代码 =====
         messages, max_ctx, limit = self._init_run(query)
 
@@ -934,30 +964,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         status_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
 
-        '''
-        self._reset_skill_state()   # =====新增：每次运行前强制重置技能状态
-        logger.info(f"Starting native FC query: {query}")
-
         
-        # [CHANGED] 不再在外部构建 tool_schemas，改为循环内动态构建
-        # 构建工具 schema（不含 use_skill? 保留，因为要拦截）
-        tool_schemas = [{
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t["description"],
-                "parameters": t.get("parameters", {"type": "object", "properties": {}}),
-            }
-        } for t in self.tools]
-        
-
-        messages = [
-            {"role": "system", "content": ""},  # 占位
-            {"role": "user", "content": query}
-        ]
-        max_ctx, limit = self._max_context_messages, self._tool_result_limit
-        '''
-
         # ===== 替换初始化代码 =====
         messages, max_ctx, limit = self._init_run(query)
 
