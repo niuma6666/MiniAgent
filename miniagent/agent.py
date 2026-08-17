@@ -288,7 +288,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
     
     
     
-    def _use_skill_handler(self, skill_name: str) -> str:
+    def _use_skill_handler(self, **kwargs) -> str:
         """
         处理 use_skill 工具调用的执行器。
         只负责加载 Skill 对象并暂存到 self._loaded_skill，不修改 messages。
@@ -298,7 +298,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         from .skills import get_skill, _SKILLS
         
         start = time.perf_counter()
-    
+        skill_name = kwargs.get("skill_name") or kwargs.get("skill")  # 从 kwargs 提取
+
         skill = get_skill(skill_name)
         if not skill:
             self._reset_skill_state()
@@ -500,11 +501,14 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
     
             logger.debug("No tool call pattern matched")
 
-        # 新增：当所有解析尝试都失败时，记录前200字符供调试
-        #logger.warning(f"无法解析的工具调用内容(前200字符): {content[:200]}")
         
-        console.print(f"[dim]⚠️ 无法解析的工具调用内容(前200字符): {content[:200]}[/dim]")
+        # 如果所有解析尝试都失败，判断是否包含明确的工具指示词
+        if re.search(r'TOOL:|工具:', content, re.IGNORECASE):
+            console.print(f"[dim]⚠️ 无法解析的工具调用内容(前200字符): {content[:200]}[/dim]")
+
+        # 否则，静默返回 None（不输出任何警告）
         return None
+        
 
 
 
@@ -976,6 +980,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 })
                 continue  # 下一轮
 
+            
             # 处理 use_skill
             if tool_call["name"] == "use_skill":
                 result_str = self._use_skill_handler(**tool_call["arguments"])
@@ -984,6 +989,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                     "content": f"工具 '{tool_call['name']}' 执行结果：{result_str}"
                 })
                 continue  # 下一轮，此时 _loaded_skill 已更新
+            
+
 
             # 执行其他工具
             result_str, rejected = self._safe_execute_tool(tool_call, tool_callback, status_callback, limit)
@@ -1076,6 +1083,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 except json.JSONDecodeError:
                     arguments = parse_json(tc.function.arguments) or {}
 
+                
                 if tool_name == "use_skill":
                     result_str = self._use_skill_handler(**arguments)
                     messages.append({
@@ -1086,6 +1094,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                     # 注意：_loaded_skill 和 _skill_tool_whitelist 已更新，
                     # 下一轮循环会使用新的过滤列表
                     continue
+                
 
                 tool_call_info = {"name": tool_name, "arguments": arguments}
                 result_str, rejected = self._safe_execute_tool(
@@ -1098,24 +1107,6 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                     "content": content,
                 })
 
-
-        '''
-        # 超出迭代次数，强制最终回答
-        logger.warning(f"Native FC reached max iterations ({max_iterations})")
-        messages.append({
-            "role": "user",
-            "content": "请根据已有信息，用中文给出最终答案，并以 FINAL_ANSWER: 开头。"
-        })
-        final_response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=self.temperature,
-        )
-        final = final_response.choices[0].message.content
-        if final and final.strip().startswith("FINAL_ANSWER:"):
-            return final[len("FINAL_ANSWER:"):].strip()
-        return final or ""
-        '''
 
         # ===== 替换结尾的强制回答代码（现在统一使用 _call_llm） =====
         return self._force_final_answer(messages, max_iterations)
